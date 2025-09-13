@@ -46,11 +46,6 @@
                                 lctx = llama_init_from_model(model, cparams);
                                             ctx = new llama_context(*model, params);   // 这里开始初始化上下文，在llama_context的构造方法中完成了大量的初始化工作
                                                             1.初始化了 GPU后端，加速卡后端，CPU后端，线程池等
-                                                            2.初始化了 kv-cache
-                                                            3.初始化了调度器和缓冲区
-                                                            4.预分配计算图和权重的所需的缓冲区内存
-                                                            其中 cann cpu 的后端初始如下：
-                                                                    // add accel backend
                                                                     for (auto * dev : model.devices) {    //在npu上，到这里进来了，检测到了有 8 张卡
                                                                         ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);    //从这里开始初始化  在这里循环了8次
                                                                         backends.emplace_back(backend);
@@ -79,30 +74,35 @@
                                                                                                         其他的运行时资源还没有初始化
                                                                     返回一个 ggml_backend_t 对象 backend 然后这个对象会被 放入 llama_context 的一个持有数组对象中  backends.emplace_back(backend)
                                                             
-                                                                然后，类似的调用流程 初始化了  CPU backend
+                                                            2.然后，类似的调用流程 初始化了  CPU backend
                                                                 backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);  // 在这里完成了 cpu 后端的初始化
                                                                 backends.emplace_back(backend_cpu);
 
-                                                                到此为止，有了 9 个后端，然后把这 9 个后端的 名为ggml_backend_set_n_threads的函数接口到 放到一个里表中，方便后面给每个后端设置线程数
+                                                            3.到此为止，有了 9 个后端，然后把这 9 个后端的 名为ggml_backend_set_n_threads的函数接口到 放到一个里表中，方便后面给每个后端设置线程数
 
+                                                            4.设置 abort 回调  这里埋入了一个中断函数指针，该函数指针在推理时每个node结束都会扫一眼，如果有中断信号，就该图退出推理。
 
-                                                                接下来初始化 kv-cache 调度器 缓冲区 等组件的时候，应该会开始 申请 aclrt 的运行时资源。
-
-                                                                    
-                                                                                            
+                                                            8. 分配输出缓冲区（logits/embd）    调用  output_reserve  分配 logits/embedding 缓冲区   这是构造过程中第一处大内存分配  输出 buffer 的大小 ≈  n_seq_max * (n_vocab + n_embd) * sizeof(float) 
+                                                            9. 初始化 Memory 模块（KV cache）    根据参数分配 KV cache（存 K/V 张量用来复用注意力）  会预分配 KV tensor 的 backend buffer
+                                                                                                这类的详情见 llama.cpp的kv-cache.cpp
+                                                            10. 构建 scheduler，决定 pipeline 并行与 buffer 分配策略  
+                                                                                                    按 backend 数量构造调度器 会决定：
+                                                                                                            buffer 如何分配
+                                                                                                            是否启用 pipeline 并行
+                                                                                                            检查每个设备是否支持 async & events，如果不支持则关闭并行 pipeline 
+                                                            11. 检测/开启 Flash Attention   这是兼容性检测 因为不是所有的设备都支持flashattention
+                                                                                                        如果  params.flash_attn_type == AUTO ：
+                                                                                                        临时构造一个 test graph
+                                                                                                        遍历所有节点，检查 FA 算子 (Flash Attention) 的设备分配是否与 KV 层一致
+                                                                                                        如果 mismatch，禁用 FA
+                                                                                                        否则开启
+                                                            12. 预留 graph (prompt + token gen)   提前预分配 graph 内部用 buffer（算子中间结果） 避免推理时  ggml alloc  的频繁 re malloc  此处会做第二波大内存分配。 
+                                                            13. 打印 compute buffer 内存占用      打印每个设备占用多少显存/内存
+                                                            14. 构建 graph result 容器          尽量复用结果容器，用于保存 graph 的执行结果和 output tensor。 避免反复 new/delete。
+                                                            15. 构造完成    至此， llama_context  进入可用状态                                                                                    
                                                                                         
 
 
-
-
-
-
-                    
-                        
-
-
-
-                                                         
 
 
                     common_init_from_params(params); // 初始化模型和上下文
