@@ -20,12 +20,10 @@ gguf.cpp:                                   GGUF 文件格式处理器。负责�
 ggml-opt.cpp:                               优化与训练框架。在 ggml 基础上实现了模型训练所需的功能，包括数据集处理、损失函数计算、反向传播和优化器（如 AdamW）的应用。
 
 
-
-
 大致的后端 架构 清楚了， 下一步和 cann 实际后端 对接上，  看看  alc 的具体初始化， 缓存管理  流管理， 究竟几个流在执行，每个流在干啥。
 
 
-然后就需要理解debug 一次 ，启动起来，   这里 已经成功
+然后就需要理解debug 一次 ，启动起来，   这里 已经成功了
 
 
 然后要搞清楚  kv-cache 究竟是怎么 实现的 什么 机制  
@@ -33,4 +31,26 @@ ggml-opt.cpp:                               优化与训练框架。在 ggml 基
 
 
 最后就可以 搞清楚 Tensor 的具体的计算的过程了
+
+
+=============================
+
+到目前为止我们基本搞清了 llama.cpp 层定义了main函数入口，model数据结构，llama_context是整个runtime核心，启动llama.cpp 主要就是启动llama_context
+我们还了解了ggml 是先在几定义了一套 ggml_tensor 以及它的算子，然后定义graph 以及调度它的scheduler, 然后tensor要存在真实的内存上，算子要运行在真实的计算卡上，所以需要对应的后端来执行。
+为此用编译注册和接口隔离的方式支持了多款后端，这些后端的启动涉及 类型发现，设备发现，设备注册，设备后端实例化，设备后端实例控制设备启动，分配内存，等等一整套初始化。
+ggml层定义的算子，对应的在每个后端都有一个实现，cgraph会被发给后端执行，对应的后端会遍历每个节点，执行该节点上的算子，然后这个算子都有一个对应的后端上的实现，真正在设备上计算。
+
+ggml_cann_backend 实现了 又ggml_backend 定义的 启动接口，申请 buffer 的接口， 执行计算图的接口 
+ggml 中实现并提供了 创建tensor  计算tensor 创建buffer 创建cgraph  创建scheduler  执行计算图等接口
+llama.cpp 中 定义了model能转为cgraph  设计了llama_context运行时  设计了mem管理   设计kv-cache 串起来就可以LLm推理了
+
+但是我们还是有大片的迷雾：
+    1. kv-cache 究竟是怎么运行来加速和节省内存的
+          kv_cache 和 flash_attention 怎么结合的
+          为了实现该kv-cache机制，下一层的mem接口又是怎么设计的
+    2. ggml中的tensor 以及基础算子的计算能否有一个更加清晰透彻的理解
+    3. GGUF 这种文件的设计究竟是怎么实现的，和pth相比有何优势
+    4. 开始研究llama.cpp中主打的量化应该如何实操， 量化的通识，量化在llama.cpp中的实现
+
+    
 

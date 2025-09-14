@@ -100,41 +100,12 @@
                                                             13. 打印 compute buffer 内存占用      打印每个设备占用多少显存/内存
                                                             14. 构建 graph result 容器          尽量复用结果容器，用于保存 graph 的执行结果和 output tensor。 避免反复 new/delete。
                                                             15. 构造完成    至此， llama_context  进入可用状态                                                                                    
-                                                                                        
-
-
-
-
-                    common_init_from_params(params); // 初始化模型和上下文
+                common_init_from_params的初始化就完成了
     
-    
-    
-    时，get_reg() 函数第一次被调用的位置和调用链如下：
-
-1.
-第一次调用位置： 在 ggml_backend_dev_count() 函数中，该函数定义在 ggml-backend-reg.cpp 文件的第355行：
-
-C++
 
 
 
-size_t ggml_backend_dev_count() {    return get_reg().devices.size();  // 这里调用了 get_reg()}
-2.
-调用链：
-
-main() 函数（在 main.cpp 中）调用 ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) 获取CPU后端设备
-ggml_backend_dev_by_type() 函数（在 ggml-backend-reg.cpp 第375行）调用 ggml_backend_dev_count()
-ggml_backend_dev_count() 函数调用 get_reg() 获取后端注册表的单例实例
-3.
-初始化时机： 当 ggml_backend_dev_count() 首次调用 get_reg() 时，会触发 ggml_backend_registry 类的静态局部变量 reg 的初始化。这个初始化包括：
-
-执行 ggml_backend_registry 的构造函数
-根据编译选项（如 GGML_USE_CUDA、GGML_USE_METAL 等）注册相应的后端
-初始化后端注册表中的设备和后端列表
-4.
-为什么在这里初始化： 在 llama-cli 程序启动时，需要获取可用的后端设备（如CPU、GPU等）来加载和运行模型。ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) 的调用是为了获取CPU设备，这是运行模型所必需的。而要获取设备信息，首先需要知道有多少可用的设备，这就需要调用 ggml_backend_dev_count()，进而触发 get_reg() 的第一次调用和初始化。
-
-*/
+                    */
 
 
 int main(int argc, char ** argv) {
@@ -144,17 +115,14 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);  // 初始化NUMA
     llama_init = common_init_from_params(params); // 真正的大量初始化后端、模型和上下文
 
+    //这些都是获取指针的操作
     model = llama_init.model.get();  // 获取模型
     ctx = llama_init.context.get();  // 获取上下文
     mem = llama_get_memory(ctx);   // 获取内存
     vocab = llama_model_get_vocab(model);  // 获取词汇表
     chat_templates = common_chat_templates_init(model, params.chat_template);  // 初始化聊天模板
-
-
     ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);   // 获取CPU设备
     ggml_backend_dev_backend_reg(cpu_dev);   // 获取CPU后端注册
-
-
     ggml_threadpool_new_fn(&tpp);  // 创建线程池
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);   // 关联线程池
 
