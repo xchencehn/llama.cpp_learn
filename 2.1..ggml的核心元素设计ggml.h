@@ -1,19 +1,99 @@
-#pragma once
-
-
 /*
-
-### ggml.cpp - 核心引擎
-位置 : ggml/src/ggml.cpp 作用 : GGML的核心实现文件，包含：
-
-- 张量操作的基础实现（如加法、乘法、矩阵运算等）
-- 内存管理和分配
-- 计算图构建和执行
-- 量化/反量化操作
-- 数学函数实现（激活函数、归一化等）
+这里的关键设计 主要是：
+1. ggml_context  这个ggml这个库的起手式，每个ggml_context ，就是一个tensor 管理器，它只负责管理一些tensor，每个ggml_tensor都持有一个 buffer 是一大块设备内存
+2. 创建的每个 张量 都要属于某一个 ggml_context  , 一个计算图 cgraph 也要和某个 ggml_context绑定，应为图的一个节点就是一个tensor，这些tensor要一个 ggml_context 管理 
+3. 参考啊链接如下：https://huggingface.co/blog/introduction-to-ggml
+4. 初始化   
 
 
 */
+/* 这里有一个简单的实例，展示了怎么使用 ggml 库做一次计算
+1. 先准备一个 创建 ggml_context 用的 参数对象 params
+2. 使用 params 创建出 ggml_context 对象 ctx = ggml_init(params)
+3. 然后就可以用这个函数创建新张量了，ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_A, rows_A)，
+4. 但是注意，这个时候只是在创建张量的元数据，并不会给张量分配真实的内存，更不会赋值了， 因为张量数据的真正内存是在 buffer 上，但是元数据的结构体就在当前程序的堆上
+5. 在new 张量的时候，会构造一个结构体ggml_tensor返回，这既是这个张量元数据的一部分，也是这个张量的引用， 关键是张量的数据怎么在 ctx中排布的？
+                                +----------------------+
+                                |   ggml_context 结构  |  <-- 在堆上单独分配
+                                +----------------------+
+                                        |
+                                        v
+                                +----------------------+
+                                |     内存缓冲区       |  <-- mem_buffer 指向这里
+                                +----------------------+
+                                |                      |
+                                |   ggml_object 1       |
+                                |   +----------------+  |
+                                |   | offs           |  |
+                                |   | size           |  |
+                                |   | next           |  |
+                                |   | type           |  |
+                                |   | padding[4]     |  |
+                                |   +----------------+  |
+                                |   | ggml_tensor 1  |  |
+                                |   | (张量元数据)   |  |
+                                |   +----------------+  |
+                                |   | (可选)张量数据 |  |     <-- 张量数据的存储取决于 no_alloc 标志 
+                                |   +----------------+  |              //1. 当 no_alloc = false 时： 张量数据直接分配在内存缓冲区中，紧跟在 ggml_tensor 结构之后   data 指针指向张量数据的起始位置
+                                |                      |               // 2. 当 no_alloc = true 时  不在内存缓冲区中分配张量数据  data 指针可能指向外部内存或为 NULL 这种情况下，需要后续调用 ggml_backend_alloc_ctx_tensors_from_buft 来分配实际内存 
+                                |   ggml_object 2       |
+                                |   +----------------+  |
+                                |   | offs           |  |
+                                |   | size           |  |
+                                |   | next           |  |
+                                |   | type           |  |
+                                |   | padding[4]     |  |
+                                |   +----------------+  |
+                                |   | ggml_tensor 2  |  |
+                                |   | (张量元数据)   |  |
+                                |   +----------------+  |
+                                |   | (可选)张量数据 |  |
+                                |   +----------------+  |
+                                |                      |
+                                |         ...          |
+                                |                      |
+                                +----------------------+
+        
+6. 张量数据的存储取决于 no_alloc 标志：
+        1. 当 no_alloc = false 时： 张量数据直接分配在内存缓冲区中，紧跟在 ggml_tensor 结构之后   data 指针指向张量数据的起始位置
+        2. 当 no_alloc = true 时  不在内存缓冲区中分配张量数据  data 指针可能指向外部内存或为 NULL 这种情况下，需要后续调用 ggml_backend_alloc_ctx_tensors_from_buft 来分配实际内存 
+7. ggml_backend_alloc_ctx_tensors_from_buft 把真实的张量数据需要的内存分配了之后，就可以复制了 使用 ggml_backend_tensor_set
+8. 这个时候就需要构建计算图了：
+9. 计算图使用通过 ggml_new_graph(ctx) 初始化出来的，因为图的每个计算节点都是一个 ggml_tensor，这些tensor 都要一个 ggml_context 来创建和管理
+10. 计算图的推导 通过 ggml_build_forward_expand(gf, result0) 完成，  沿着 result0 反向便利整个图，就能给 gf每个节点赋值了 
+11. 然后 ggml_backend_graph_compute(backend, gf) 就可以把 图发给后端执行了
+
+*/ 
+
+main(){
+
+    struct ggml_init_params params = {
+                /*.mem_size   =*/ ctx_size,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true, //如果是 true 指的是创建张量的时候不分配内存，后面使用专门的函数给张量分配内存
+        };
+    struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_A, rows_A);   //输入1
+    struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_B, rows_B);   //输入2
+    struct ggml_tensor * result0 = ggml_mul_mat(ctx, tensor_a, tensor_b);   // 算子 和 输出
+
+    struct ggml_backend * backend = ggml_backend_gpu_init();  // 初始化一个backend
+    ggml_backend_alloc_ctx_tensors(ctx, backend);   // 分配data实际空间
+
+    ggml_backend_tensor_set(tensor_a, matrix_A, 0, ggml_nbytes(tensor_a));   // 张量赋值
+    ggml_backend_tensor_set(tensor_b, matrix_B, 0, ggml_nbytes(tensor_b));   // 张量赋值
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);  // 图初始化
+    ggml_build_forward_expand(gf, result0);   // 图编译，编译后赋值给 gf
+
+    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)); // 获取后端内存分配器
+    ggml_gallocr_alloc_graph(allocr, gf);  // 使用内存分配器给图分配内存
+
+    ggml_backend_graph_compute(backend, gf);  // 把图交给后端执行
+
+}
+
 //
 // GGML Tensor Library
 //
@@ -94,17 +174,35 @@
 // in advance how much memory you need for your computation. Alternatively, you can allocate a large enough memory
 // and after defining the computation graph, call the ggml_used_mem() function to find out how much memory was
 // actually needed.
+
+// ggml_new_tensor_...() 系列函数用于创建新的张量。这些张量会被分配到传递给 使用ggml_init()函数申请的内存缓冲区中。
+// 你必须小心，不要超出内存缓冲区的大小。因此，你需要提前知道计算所需的内存量。
+// 或者，你也可以分配足够大的内存，在定义完计算图后，调用 ggml_used_mem() 函数来确定实际需要的内存量。
+
 //
 // The ggml_set_param() function marks a tensor as an input variable. This is used by the automatic
 // differentiation and optimization algorithms.
+
+// ggml_set_param() 函数将一个张量标记为输入变量。自动微分和优化算法会使用到这一标记。
 //
+// 上述方法允许用户仅定义一次函数图，之后可多次计算其前向图或反向图。
+// 所有计算都会使用在 ggml_init() 函数中分配的同一个内存缓冲区。
+// 通过这种方式，用户可以避免运行时的内存分配开销。
+
 // The described approach allows to define the function graph once and then compute its forward or backward graphs
 // multiple times. All computations will use the same memory buffer allocated in the ggml_init() function. This way
 // the user can avoid the memory allocation overhead at runtime.
 //
+// 该库支持多维张量 - 最多支持 4 维。FP16 和 FP32 数据类型是主要支持的类型，
+// 但理论上该库可以扩展以支持 FP8 和整数数据类型。
+
 // The library supports multi-dimensional tensors - up to 4 dimensions. The FP16 and FP32 data types are first class
 // citizens, but in theory the library can be extended to support FP8 and integer data types.
 //
+// 每个张量操作都会产生一个新的张量。最初，该库被设想为仅支持一元和二元操作。
+// 大多数可用的操作都属于这两类之一。随着时间的推移，很明显该库需要支持更复杂的操作。
+// 目前支持这些操作的方式尚不清楚，但以下操作展示了一些示例：
+
 // Each tensor operation produces a new tensor. Initially the library was envisioned to support only the use of unary
 // and binary operations. Most of the available operations fall into one of these two categories. With time, it became
 // clear that the library needs to support more complex operations. The way to support these operations is not clear
@@ -114,6 +212,10 @@
 //   - ggml_conv_1d_1s()
 //   - ggml_conv_1d_2s()
 //
+// 对于每个张量运算符，该库实现了前向和反向计算函数。前向函数根据输入张量的值计算输出张量的值。
+// 反向函数根据输出张量的伴随张量计算输入张量的伴随张量。要详细了解这意味着什么，请参加微积分课程，
+// 或观看以下视频：
+
 // For each tensor operator, the library implements a forward and backward computation function. The forward function
 // computes the output tensor value given the input tensor values. The backward function computes the adjoint of the
 // input tensors given the adjoint of the output tensor. For a detailed explanation of what this means, take a
@@ -125,6 +227,9 @@
 //
 // ## Tensor data (struct ggml_tensor)
 //
+// 张量通过 ggml_tensor 结构体存储在内存中。该结构体提供了关于张量大小、数据类型以及存储张量数据的内存缓冲区的信息。
+// 此外，它还包含指向 “源” 张量的指针，即用于计算当前张量的那些张量。例如：
+
 // The tensors are stored in memory via the ggml_tensor struct. The structure provides information about the size of
 // the tensor, the data type, and the memory buffer where the tensor data is stored. Additionally, it contains
 // pointers to the "source" tensors - i.e. the tensors that were used to compute the current tensor. For example:
@@ -136,6 +241,10 @@
 //       assert(c->src[1] == b);
 //   }
 //
+// 多维张量按行优先顺序存储。ggml_tensor 结构体包含每个维度的元素数量（"ne"）以及每个维度的字节数（"nb"，也称为步长）。
+// 这使得可以存储在内存中不连续的张量，这对于转置和置换等操作非常有用。
+// 所有张量操作都必须考虑步长，不能假设张量在内存中是连续的。
+
 // The multi-dimensional tensors are stored in row-major order. The ggml_tensor struct contains fields for the
 // number of elements in each dimension ("ne") as well as the number of bytes ("nb", a.k.a. stride). This allows
 // to store tensors that are not contiguous in memory, which is useful for operations such as transposition and
@@ -159,6 +268,7 @@
 //       ...
 //   }
 //
+// 另外，也可以使用一些辅助函数，例如 ggml_get_f32_1d() 和 ggml_set_f32_1d()。
 // Alternatively, there are helper functions, such as ggml_get_f32_1d() and ggml_set_f32_1d() that can be used.
 //
 // ## The matrix multiplication operator (ggml_mul_mat)
@@ -186,7 +296,7 @@
 // TODO
 //
 //
-
+#pragma once
 #ifdef GGML_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
 #        ifdef GGML_BUILD

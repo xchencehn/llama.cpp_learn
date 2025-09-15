@@ -1,3 +1,29 @@
+/*
+
+先分析一下 ggml_init(params) 这个函数被调用了几次，以及它的调用栈：
+    1. 第一次：mian()
+                common_params_parse()
+                    common_params_paraser_init()
+                        ggml_backend_load_all()
+                            ggml_backend_load_all_from_patch()
+                                ggml_backend_load_best()
+                                    get_reg()
+                                        ggml_backend_registry()
+                                            ggml_backend_cpu_reg()
+                                                ggml_cpu_init()
+                                                    ggml_init()
+    2. 第二次：main()
+                llama_backend_init()
+                    ggml_init()
+    
+    3.第三次：  后面怎么好像在 模型还在权重的时候 每加载一个张量就会调用一次， 这个函数究竟是是干啥的，我还以为是加载后端的，看来不是
+
+    https://huggingface.co/blog/introduction-to-ggml
+
+
+*/
+
+
 #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 

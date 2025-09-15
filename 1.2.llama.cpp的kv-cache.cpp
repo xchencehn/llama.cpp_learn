@@ -1,3 +1,95 @@
+// llama_kv_cache 是llama.cpp中用于管理键值(KV)缓存的核心类，它在Transformer架构的推理过程中扮演着至关重要的角色。
+// KV缓存存储了自注意力机制中的键(K)和值(V)向量，避免了重复计算，从而显著提高了推理效率。
+
+
+// 这里 全局就是 一个 llama_context 对应了一个 memory 对象， 这个一个 memory 怎么管理多个后端的实际内存的呢？
+
+/*
+研究kv-cahce的入口在 llama_context 的构造函数的memory初始化的地方；
+        // 这里的memory 是一个智能指针，指向一个llama_memory_i的派生类对象
+        // 该对象负责管理KV缓存的内存分配和更新
+        // 该对象的具体类型由model.create_memory()决定
+        memory.reset(model.create_memory(params_mem, cparams));
+                        我们先进入 create_memory 看看究竟是怎么构造memory的， 整个函数的签名返回的就是一个  llama_memory_i的派生类对象
+                        这里一进来就 根据当前的模型架构 switch-case, 有 循环注意力机制，混合注意力机制，以及 tranformer默认的注意力机制， 这个默认的又分为 普通的全序列和滑动窗口注意力两种
+                        这里的 gemma3 是一个滑动窗口注意力机制  执行了 res = new llama_kv_cache_iswa(
+                                 这里的llama_kv_cache_iswa 一个封装了的 注意力机制，因为在 gemma3 模型的内部， 有的layer使用的是线性注意力机制，但有的layer使用是全序列的layer的注意力机制
+                                 所以在 llama_kv_cache_iswa 就创建了两个 kv-cache 对象：
+                                            kv_base = std::make_unique<llama_kv_cache>    //使用正常的非滑动窗口的全序列注意力机制
+                                            kv_swa = std::make_unique<llama_kv_cache>     // 使用滑动窗口的注意力机制
+                                 要更进一步的理解这里的kv-cache, 在构造函数中有四个参数必须理解深刻：
+                                            kv_size      表示KV缓存中可以存储的token数量，用于初始化 v_cells 数组的大小
+                                            n_seq_max    表示最多可以开几个 kv_cache stream 来存放 n_seq_max个序列的kv, 统一模式下一个stream 一块内存把大家的存一起，非统一模式下一个序列一个流隔离开
+                                            n_ubatch     意思是每次推理会从batch中挑出ubatch个序列，每个序列生成一个token
+                                            n_pad        表示内存对齐的填充大小，用于确保内存访问的对齐
+                                在 llama.cpp 中 还分 统一模式和非统一模式 两种不同的KV缓存管理和批处理策略
+                                            在统一模式下，所有序列共享同一个KV缓存流（stream），即 n_stream = 1
+                                            在非统一模式下，每个序列都有自己独立的KV缓存流，即 n_stream = n_seq_max
+
+                                                            进一步的我们要搞清楚 kv-cache 究竟是是什么，打开kv-cache.h 看看定义具体的实现
+                                                            首先llama_kv_cache 继承自 llama_memory_i 接口，让别人操作，进入首先llama_kv_cache的构造函数
+                                                                    首先给一堆成员变量赋值model, hparams, v_trans, n_seq_max, n_stream, n_pad, n_swa, swa_type
+                                                                    创建 v_heads 这是是一个向量 std::vector<uint32_t> , 大小和序列数量一样多  存储每个流的当前头指针，用于环形缓冲区管理
+                                                                    创建 v_cells 这是一个向量 std::vector<llama_kv_cells> , 大小也和序列数量一样多， 用于存储KV缓存的状态信息，如位置、序列ID等
+                                                                    创建 seq_to_stream 字段是一个向量 std::vector<uint32_t> 用作从序列ID到流ID的映射;
+                                                                    为每层创建KV张量  for (uint32_t il = 0; il < hparams.n_layer; il++) {
+                                                                        获取K和V的嵌入维度
+                                                                        选择缓冲区类型 buft 和设备dev_name
+                                                                        在每层执行到这里的时候都使用 ggml_init(params) 初始化了一个ggml_context * ctx, 这里分配了一块 当前程序的堆内存，用于管理张量元数据
+                                                                        使用ctx 创建出了 k 和 v 需要的张量， 每个 都是一个3D张量， 从内到外依次是 embeding维度，token的数量，序列的数量
+                                                                        需要注意的是，这里只是创建了张量的元数据，并不会立即发生内存分配 ，这是因为 ctx 中的参数 .no_alloc = true
+                                                                        所以在下面还有 一段代码 ggml_backend_alloc_ctx_tensors_from_buft 专门分配内存
+                                                                        而且每个张量都是有名字字段的，这里给命名为 cache_k_l0  cache_k_l1 等
+                                                                        上面直接 使用 k v 两个3D张量访问具体某个序列的某个token缓存不方便
+                                                                        这里再做一个 2D视图， 这样就可以直接通过 k_stream[s] 访问第 s 个流的所有 token 缓存
+                                                                        为每个GGML上下文分配对应的内存缓冲区 ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft)
+
+                                                            到此llama_kv_cache就算是初始化完成了， 给每一层都 创建了两个大张量 kv
+                        到此llama_kv_cache_iswa 也就初始完成了，可以返回reg
+        到此 reg 赋值给智能指针 memeroy
+    
+
+
+        这里把 creat_memory创建的kv_cache对象的 llama_memory_i* 类型的指针 赋值给了 memory 智能指针
+        memory.reset(model.create_memory(params_mem, cparams));   //这里reset() 是 std::unique_ptr 的方法，重置智能指针所管理的对象
+        这里的 llama_memory_i 暴露出了哪些接口用来操控 kv_cache ？
+        
+
+
+
+
+
+
+*/
+
+
+/*  滑动窗口
+滑动窗口注意力是一种优化Transformer模型注意力计算的技术，其核心思想是限制每个token只能关注固定窗口内的其他token，而不是全局所有token。
+
+那这里new出来的 是一个 llama_kv_cache_iswa 是个什么机制呢？
+    这个指的是 在 gemma3 模型的内部， 有的layer使用的是线性注意力机制，但有的layer使用是全序列的layer的注意力机制。
+*/
+
+/*   智能指针
+
+将这个实例包装在一个 std::unique_ptr 智能指针中
+        kv_base = std::make_unique<llama_kv_cache>    //使用正常的非滑动窗口的全序列注意力机制
+        kv_swa = std::make_unique<llama_kv_cache>     // 使用滑动窗口的注意力机制
+
+使用 std::make_unique 而不是直接使用 new 有几个优势：
+1. 异常安全 ：如果构造函数抛出异常，不会发生内存泄漏
+2. 资源管理 ：智能指针会自动在适当的时候释放内存，防止内存泄漏
+这种写法是现代C++中推荐的资源管理方式，特别是在处理需要动态分配的对象时。
+
+
+*/
+
+
+
+
+
+
+
 #include "llama-kv-cache.h"
 
 #include "llama-impl.h"
