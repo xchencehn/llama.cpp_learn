@@ -94,52 +94,82 @@
                                                                           在 new llm_graph_result 对象的时候,有两个管家你的属性
                                                                                     ctx_compute.reset(ggml_init(params));   //计算图持有的张量容器ggml_contxt，
                                                                                     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false); //真正的计算图
-                                                                                            在初始化张量容器的时候，计算并分配了图计算所需的元数据内存大小  总内存大小 = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false)
-                                                                                                                                                     = 所有张量结构体的开销总和 + 图结构本身的开销
-                                                                                                                                                     = (GGML对象的基本大小 + 张量结构体的大小) * max_nodes + (GGML对象的基本大小 + 对齐后的图结构字节大小)
-                                                                                                                                                                                                                                 图结构字节大小 = ggml_graph_nbytes() 函数计算图结构所需的字节大小。
-                                                                                                                                                                                                                                 它模拟了内存分配过程，通过 incr_ptr_aligned 函数累加各部分内存需求：
-                                                                                                                                                                                                                                    1.sizeof(struct ggml_cgraph) ：图结构体本身的大小
-                                                                                                                                                                                                                                    2.size * sizeof(struct ggml_tensor *) ：节点指针数组的大小
-                                                                                                                                                                                                                                    3.size * sizeof(struct ggml_tensor *) ：叶子节点指针数组的大小
-                                                                                                                                                                                                                                    4.hash_size * sizeof(int32_t) ：使用计数数组的大小
-                                                                                                                                                                                                                                    5.hash_size * sizeof(struct ggml_tensor *) ：哈希键数组的大小
-                                                                                                                                                                                                                                    6.如果需要梯度( grads=true )，还包括梯度和梯度累加器数组的大小
-                                                                                                                                                                                                                                    7.ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t) ：位集的大小
-                                                                                                                                                                                                                                    其中 hash_size = ggml_hash_size(size * 2) 是哈希表的大小，通常是图节点数的两倍。
-                                                                                                                                                                                                                                在这里 每一次计算的指针都是 incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes 移动的
-                                                                                                                                                                                                                                incr_ptr_aligned中 每一段都会对内存对齐，所谓对齐就是将指针移动到下一个sizeof(struct ggml_tensor *) 的倍数的位置上，这样可以提高内存访问的效率，避免访问未对齐的内存导致的性能下降
-                                                                                            在初始计算图对象的时候，
-                                                                                                        首先调用 ggml_graph_nbytes 函数计算整个计算图结构所需的内存大小
-                                                                                                        在刚才创建的 ggml_contxt 上下文对象中创建一个类型为 GGML_OBJECT_TYPE_GRAPH 的对象
-                                                                                                        然后初始化了计算图的内存布局：
-                                                                                                                +-------------------+
-                                                                                                                | ggml_cgraph       |  计算图结构体
-                                                                                                                +-------------------+
-                                                                                                                | nodes_ptr         |  节点指针数组
-                                                                                                                +-------------------+
-                                                                                                                | leafs_ptr         |  叶子节点指针数组
-                                                                                                                +-------------------+
-                                                                                                                | use_counts_ptr    |  使用计数数组
-                                                                                                                +-------------------+
-                                                                                                                | hash_keys_ptr     |  哈希键数组      这里使用hash表是为了快速的索引到所有的节点和叶子节点
-                                                                                                                +-------------------+
-                                                                                                                | grads_ptr         |  梯度指针数组（可选）
-                                                                                                                +-------------------+
-                                                                                                                | grad_accs_ptr     |  梯度累加器数组（可选）
-                                                                                                                +-------------------+
-                                                                                                                | hash_used         |  哈希使用位集合
-                                                                                                                +-------------------+
+                                                                                            在这个函数中，实例化了一个cgraph对象，可以看看cgrph的结构体定义：
+                                                                                                                    struct ggml_cgraph {
+                                                                                                                        int size;    // maximum number of nodes/leafs/grads/grad_accs
+                                                                                                                        int n_nodes; // number of nodes currently in use
+                                                                                                                        int n_leafs; // number of leafs currently in use
+                                                                                                                        struct ggml_tensor ** nodes;     // 这里为啥要使用指针的指针呢？
+                                                                                                                        struct ggml_tensor ** grads;     // the outputs of these tensors are the gradients of the nodes
+                                                                                                                        struct ggml_tensor ** grad_accs; // accumulators for node gradients
+                                                                                                                        struct ggml_tensor ** leafs;     // tensors with constant data
+                                                                                                                        int32_t             * use_counts;// number of uses of each tensor, indexed by hash table slot
+                                                                                                                        struct ggml_hash_set visited_hash_set;
+                                                                                                                        enum ggml_cgraph_eval_order order;
+                                                                                                                    };
+                                                                                                                    解释这里使用 指针的指针的必要性：
+                                                                                                                        1.主要是为了这么使用 cgraph.nodes[i] ，从而这么设计的
+                                                                                                                            struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_nodes, false); // 创建图
+                                                                                                                            gf->nodes[gf->n_nodes++] = tensor; // 添加节点
+                                                                                                                            for (int i = 0; i < gf->n_nodes; i++) {  
+                                                                                                                                struct ggml_tensor * node = gf->nodes[i];   // 访问节点
+                                                                                                                                // 处理节点...
+                                                                                                                            }    
+                                                                                                                        2. 而且这里的 nodes 数组需要在运行时能够动态分配，这个问题在 python java 等支持动态数组的语言中没有感知，但是在c语言中这个功能要自己考虑怎么实现
+                                                                                                                        3. 这里使用 指针的指针，这样 就可以在运行时再分配一个 指针数组， 把其地址挂到gf->nodes上，然后就可以gf->nodes[i] 访问 ggml_tensor 结构体了
+                                                                                                                        4. 但是这个 指针数组 一经分配，大小也就确定了， 需要扩容就要整个重新分配一个更大的数组，然后把原来的数据拷贝过来
+                                                                                                                        5. 从始至终这里的 cgraph 结构体是不会变的
                                                                                             cgraph初始化完成    
                                                                           到这里两个计算图 gf_res_prev gf_res_reserve 就初始化完成了，但是这个时候分配的空间里面存的都是 张量元数据 ggml_tensor ggml_tensor_object这些对象大小，但是这里面的 data 字段的指针还是空的，还没有分配真正的后端的内部
                                                                     然后就检查了是否启用 pipeline 并行 检查每个设备是否支持 async & events，如果不支持则关闭并行 pipeline 
-                                                                    这里就开始创建调度器了：sched.reset(ggml_backend_sched_new(...))
-                                                                         详细的解剖这里的 创建过程：
+                                                                    这里就开始创建调度器了：sched.reset(ggml_backend_sched_new(...))  在这个函数中， 创建了调度器用于管理多个后端和计算图的执行
+                                                                        在上面的步骤中我们已经把原始的计算图cgraph结构体搞定了，但是我们并没有实例cgraph里面的张量，现在，这些都放在调度器对象中，
+                                                                        在这个调度器中，我们要能快速的把原始图随意的切分做流水线，随意的备份做并行计算，这件事情怎么做呢? 这里的初始化有一个思想，
+                                                                        
+                                                                        我们在内存中搞一个大操场，在 scheduler中搞一个大操场，在这个操场上划分了两块区域，左边代表完全打散排布，右边代表组合成图排布
+                                                                        
+                                                                        在左边 我们假设 我们这个计算图可能会有 模型中张量的数量的8倍个节点，而且每个节点都被拆成子图，每个子图都有30个输入，每个输入跨设备要有个副本
+                                                                        我们就按照这个方式在操场左边摆放好了所有张量的座位
+
+                                                                        在右边我们假设一台机器上最多只有16张卡， 每张卡只会执行一张子图，那么最多有16张子图就好了
+                                                                        我们依然给每个子图有30个输入张量，我们也按照这个方式在操场的右边摆好了座位
+
+                                                                        现在我们 一些数组，左边的组数长度等于左边的座位数量，右边的右边的座位数量，这就相当于主席台上的笔记本，左边是名单，右边是组合结果
+                                                                        后面需要调度，分割都是对着这个笔记本操作的
+
+                                                                        至于座位什么要分这么多，没有为什么，就是先全占着，尽可能占上，反正座位占不了多少空间，后面操作 gf->nodes[i++] 就可以很方便的操作了
+
+                                                                        这里有一个笔记本是记录张量副本的索引hv_tensor_copies， 它的使用方法很有机制：
+                                                                                        1. hv_tensor_copies 是一个三维数组，定义为 [hash_set.size][n_backends][n_copies]
+                                                                                        2. 这个数组存储了张量在不同后端和不同副本索引下的副本指针
+                                                                                        3. 只有计算图中的节点或者叶子节点可能会有副本：
+                                                                                                3.1 当一个张量在一个后端上生成，但需要在另一个后端上使用时，会创建副本
+                                                                                                3.2 在计算图分割过程中，不同分割之间的边界张量需要副本
+                                                                                                3.3 当启用流水线并行时，为了支持不同阶段的并行执行，会创建多个副本
+                                                                                        4. 只要一个张量有了副本，就会有数据一致性的问题需要解决，从这里也能够看出就是一个张量需要在多个设备上使用就会有多个副本
+                                                                                            但是不同副本的使用时机会有严格的依赖顺序，例如，把一个图分割两个子图，前半段在GPU上，后半段在CPU上，
+                                                                                            那么断裂出的张量都会在两个GPU CPU上各有一个副本
+                                                                                            现在GPU上算，完成后这些张量已经被赋值了，
+                                                                                            然后会把这些张量的data跨设备同步到CPU上，这里就是主要延迟点
+                                                                                            然后在CPU上继续算
+                                                                                        5. 这就是张量副本的使用方法
+                                                                                        
+                                                                        todo: 接下来就是要分配真正后端的内存了，看看还会这么浪费的分配占用吗？
+
+                                                                        基于这个思想，整个cgraph的初始化步骤大致为：
+                                                                            函数参数和断言检查
+                                                                            调度器结构体的分配和初始化
+                                                                            哈希表的初始化
+                                                                            各种数组和缓冲区的分配
+                                                                            后端和缓冲区类型的初始化
+                                                                            事件和内存分配器的创建
+                                                                            调度器指针赋值
 
 
 
 
-                                                                                                                                                                                                                                                                                                                 
+
+
                                                             11. 检测/开启 Flash Attention   这是兼容性检测 因为不是所有的设备都支持flashattention
                                                                                                         如果  params.flash_attn_type == AUTO ：
                                                                                                         临时构造一个 test graph

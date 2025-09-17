@@ -65,6 +65,47 @@
 
 */ 
 
+
+/*  看看计算图的数据结构
+
+
+struct ggml_cgraph {
+    int size;    // maximum number of nodes/leafs/grads/grad_accs
+    int n_nodes; // number of nodes currently in use
+    int n_leafs; // number of leafs currently in use
+
+    struct ggml_tensor ** nodes;     // 这里为啥要使用指针的指针呢？
+    struct ggml_tensor ** grads;     // the outputs of these tensors are the gradients of the nodes
+    struct ggml_tensor ** grad_accs; // accumulators for node gradients
+    struct ggml_tensor ** leafs;     // tensors with constant data
+    int32_t             * use_counts;// number of uses of each tensor, indexed by hash table slot
+
+    struct ggml_hash_set visited_hash_set;
+
+    enum ggml_cgraph_eval_order order;
+};
+
+
+解释这里使用 指针的指针的必要性：
+    1.主要是为了这么使用 cgraph.nodes[i] ，从而这么设计的
+            // 创建图
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, n_nodes, false);
+
+        // 添加节点
+        gf->nodes[gf->n_nodes++] = tensor;
+
+        // 访问节点
+        for (int i = 0; i < gf->n_nodes; i++) {
+            struct ggml_tensor * node = gf->nodes[i];
+            // 处理节点...
+        }    
+
+    2. 而且这里的 nodes 数组需要在运行时能够动态分配，这个问题在 python java 等支持动态数组的语言中没有感知，但是在c语言中这个功能要自己考虑怎么实现
+    3. 这里使用 指针的指针，这样 就可以在运行时再分配一个 指针数组， 把其地址挂到gf->nodes上，然后就可以gf->nodes[i] 访问 ggml_tensor 结构体了
+    4. 但是这个 指针数组 一经分配，大小也就确定了， 需要扩容就要整个重新分配一个更大的数组，然后把原来的数据拷贝过来
+    5. 从始至终这里的 cgraph 结构体是不会变的
+*/
+
 main(){
 
     struct ggml_init_params params = {
