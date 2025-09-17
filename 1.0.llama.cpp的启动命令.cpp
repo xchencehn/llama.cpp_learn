@@ -85,11 +85,61 @@
                                                             8. 分配输出缓冲区（logits/embd）    调用  output_reserve  分配 logits/embedding 缓冲区   这是构造过程中第一处大内存分配  输出 buffer 的大小 ≈  n_seq_max * (n_vocab + n_embd) * sizeof(float) 
                                                             9. 初始化 Memory 模块（KV cache）    根据参数分配 KV cache（存 K/V 张量用来复用注意力）  会预分配 KV tensor 的 backend buffer
                                                                                                 这类的详情见 llama.cpp的kv-cache.cpp
-                                                            10. 构建 scheduler，决定 pipeline 并行与 buffer 分配策略  
-                                                                                                    按 backend 数量构造调度器 会决定：
-                                                                                                            buffer 如何分配
-                                                                                                            是否启用 pipeline 并行
-                                                                                                            检查每个设备是否支持 async & events，如果不支持则关闭并行 pipeline 
+                                                            10. 构建 scheduler，决定 pipeline 并行与 buffer 分配策略
+                                                                    这里首先获取了 每个后端的缓冲区类型和后端的指针，方便接些来使用
+                                                                        backend_buft 是一个 std::vector<ggml_backend_buffer_type_t> 类型的向量，用于存储每个后端的默认缓冲区类型
+                                                                        backend_ptrs 是一个 std::vector<ggml_backend_t> 类型的向量，用于存储后端指针   
+                                                                    创建两个图 gf_res_prev 和 gf_res_reserve 在后面实现图的复用或者其他高级功能会用到
+                                                                          这里的 llm_graph_result 对象，用于存储图计算结果， max_nodes 表示图中的最大节点数，这个值决定了需要分配多少内存来存储图结构
+                                                                          在 new llm_graph_result 对象的时候,有两个管家你的属性
+                                                                                    ctx_compute.reset(ggml_init(params));   //计算图持有的张量容器ggml_contxt，
+                                                                                    gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false); //真正的计算图
+                                                                                            在初始化张量容器的时候，计算并分配了图计算所需的元数据内存大小  总内存大小 = ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false)
+                                                                                                                                                     = 所有张量结构体的开销总和 + 图结构本身的开销
+                                                                                                                                                     = (GGML对象的基本大小 + 张量结构体的大小) * max_nodes + (GGML对象的基本大小 + 对齐后的图结构字节大小)
+                                                                                                                                                                                                                                 图结构字节大小 = ggml_graph_nbytes() 函数计算图结构所需的字节大小。
+                                                                                                                                                                                                                                 它模拟了内存分配过程，通过 incr_ptr_aligned 函数累加各部分内存需求：
+                                                                                                                                                                                                                                    1.sizeof(struct ggml_cgraph) ：图结构体本身的大小
+                                                                                                                                                                                                                                    2.size * sizeof(struct ggml_tensor *) ：节点指针数组的大小
+                                                                                                                                                                                                                                    3.size * sizeof(struct ggml_tensor *) ：叶子节点指针数组的大小
+                                                                                                                                                                                                                                    4.hash_size * sizeof(int32_t) ：使用计数数组的大小
+                                                                                                                                                                                                                                    5.hash_size * sizeof(struct ggml_tensor *) ：哈希键数组的大小
+                                                                                                                                                                                                                                    6.如果需要梯度( grads=true )，还包括梯度和梯度累加器数组的大小
+                                                                                                                                                                                                                                    7.ggml_bitset_size(hash_size) * sizeof(ggml_bitset_t) ：位集的大小
+                                                                                                                                                                                                                                    其中 hash_size = ggml_hash_size(size * 2) 是哈希表的大小，通常是图节点数的两倍。
+                                                                                                                                                                                                                                在这里 每一次计算的指针都是 incr_ptr_aligned(&p, size * sizeof(struct ggml_tensor *), sizeof(struct ggml_tensor *)); // nodes 移动的
+                                                                                                                                                                                                                                incr_ptr_aligned中 每一段都会对内存对齐，所谓对齐就是将指针移动到下一个sizeof(struct ggml_tensor *) 的倍数的位置上，这样可以提高内存访问的效率，避免访问未对齐的内存导致的性能下降
+                                                                                            在初始计算图对象的时候，
+                                                                                                        首先调用 ggml_graph_nbytes 函数计算整个计算图结构所需的内存大小
+                                                                                                        在刚才创建的 ggml_contxt 上下文对象中创建一个类型为 GGML_OBJECT_TYPE_GRAPH 的对象
+                                                                                                        然后初始化了计算图的内存布局：
+                                                                                                                +-------------------+
+                                                                                                                | ggml_cgraph       |  计算图结构体
+                                                                                                                +-------------------+
+                                                                                                                | nodes_ptr         |  节点指针数组
+                                                                                                                +-------------------+
+                                                                                                                | leafs_ptr         |  叶子节点指针数组
+                                                                                                                +-------------------+
+                                                                                                                | use_counts_ptr    |  使用计数数组
+                                                                                                                +-------------------+
+                                                                                                                | hash_keys_ptr     |  哈希键数组      这里使用hash表是为了快速的索引到所有的节点和叶子节点
+                                                                                                                +-------------------+
+                                                                                                                | grads_ptr         |  梯度指针数组（可选）
+                                                                                                                +-------------------+
+                                                                                                                | grad_accs_ptr     |  梯度累加器数组（可选）
+                                                                                                                +-------------------+
+                                                                                                                | hash_used         |  哈希使用位集合
+                                                                                                                +-------------------+
+                                                                                            cgraph初始化完成    
+                                                                          到这里两个计算图 gf_res_prev gf_res_reserve 就初始化完成了，但是这个时候分配的空间里面存的都是 张量元数据 ggml_tensor ggml_tensor_object这些对象大小，但是这里面的 data 字段的指针还是空的，还没有分配真正的后端的内部
+                                                                    然后就检查了是否启用 pipeline 并行 检查每个设备是否支持 async & events，如果不支持则关闭并行 pipeline 
+                                                                    这里就开始创建调度器了：sched.reset(ggml_backend_sched_new(...))
+                                                                         详细的解剖这里的 创建过程：
+
+
+
+
+                                                                                                                                                                                                                                                                                                                 
                                                             11. 检测/开启 Flash Attention   这是兼容性检测 因为不是所有的设备都支持flashattention
                                                                                                         如果  params.flash_attn_type == AUTO ：
                                                                                                         临时构造一个 test graph

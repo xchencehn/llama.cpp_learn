@@ -5,7 +5,7 @@
 // 这里 全局就是 一个 llama_context 对应了一个 memory 对象， 这个一个 memory 怎么管理多个后端的实际内存的呢？
 
 /*
-研究kv-cahce的入口在 llama_context 的构造函数的memory初始化的地方；
+研究kv-cahce的入口在 llama_context 的构造函数中 的memory初始化的地方；
         // 这里的memory 是一个智能指针，指向一个llama_memory_i的派生类对象
         // 该对象负责管理KV缓存的内存分配和更新
         // 该对象的具体类型由model.create_memory()决定
@@ -47,17 +47,13 @@
                                                             到此llama_kv_cache就算是初始化完成了， 给每一层都 创建了两个大张量 kv
                         到此llama_kv_cache_iswa 也就初始完成了，可以返回reg
         到此 reg 赋值给智能指针 memeroy
-    
+        这里的 llama_memory_i 暴露出了哪些接口用来操控 kv_cache , 可以使得持有 llama_memory_i 指针就可以如臂指使的操控kv-cache?
+                    批处理初始化接口  init_batch() init_full() init_update() 几个不同功能的初始化按钮
+                    序列操作接口 seq_rm() seq_cp() seq_keep() seq_add() seq_div() seq_pos_min() seq_pos_max() 对序列做 删除、复制、添加
+                    状态读写接口 state_write() state_read() 控制序列的可读可写的状态
 
 
-        这里把 creat_memory创建的kv_cache对象的 llama_memory_i* 类型的指针 赋值给了 memory 智能指针
-        memory.reset(model.create_memory(params_mem, cparams));   //这里reset() 是 std::unique_ptr 的方法，重置智能指针所管理的对象
-        这里的 llama_memory_i 暴露出了哪些接口用来操控 kv_cache ？
-        
-
-
-
-
+        到这里 kv-cache的初始化算是完成
 
 
 */
