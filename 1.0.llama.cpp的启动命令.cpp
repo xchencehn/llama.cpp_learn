@@ -95,16 +95,50 @@
                                                                     上面的这段内容详情见 2.3.ggml的调度器实现ggml-backend.cpp
 
 
-                                                            11. 检测/开启 Flash Attention   这是兼容性检测 因为不是所有的设备都支持flashattention
-                                                                                                        如果  params.flash_attn_type == AUTO ：
-                                                                                                        临时构造一个 test graph
-                                                                                                        遍历所有节点，检查 FA 算子 (Flash Attention) 的设备分配是否与 KV 层一致
-                                                                                                        如果 mismatch，禁用 FA
-                                                                                                        否则开启
-                                                            12. 预留 graph (prompt + token gen)   提前预分配 graph 内部用 buffer（算子中间结果） 避免推理时  ggml alloc  的频繁 re malloc  此处会做第二波大内存分配。 
-                                                            13. 打印 compute buffer 内存占用      打印每个设备占用多少显存/内存
-                                                            14. 构建 graph result 容器          尽量复用结果容器，用于保存 graph 的执行结果和 output tensor。 避免反复 new/delete。
-                                                            15. 构造完成    至此， llama_context  进入可用状态                                                                                    
+                                                            11. 检测并决定是否启用 Flash Attention  检测方法如下J：
+                                                                        这里 flash_attn_type == AUTO 说明用户没明确开/关 FA，系统要自己判定能不能用
+                                                                        graph_reserve(...) 会预构建一个小计算图 (gf)，主要用于检测 Flash Attention 节点会被安排在哪个 device 上
+                                                                        遍历图中所有节点，找到 Flash Attention 节点 (算子 GGML_OP_FLASH_ATTN_EXT)
+                                                                        查找这个 FA 节点被分配到的后端 (device_fa)。
+                                                                        根据节点名字解析出它对应的模型层号il  然后根据 模型层号il 模型层权重被放在哪个 device 上 
+                                                                        看看 如果 Flash Attention 节点和层权重分在不同 device，说明算子不被支持（或者落到了别的后端）, 就让 标记 mismatch 赋值为 true 
+                                                                        只要检测到 标记 mismatch 赋值 为true   Flash Attention 直接关闭 
+
+                                                            12. 构图测试，这里分别测试 后端的内存构建两张图会不会出问题，一张是 prompt processing 阶段的 pp图，一张是 token generation 阶段的 tg图
+                                                                        首先测试为 prompt processing 阶段准备一个 pp图 能否成功
+                                                                            构图的函数是被封装在 llama_context 中的 graph_reserve
+                                                                                graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+                                                                                    gf_res_prev->reset();   // 这里会重新构图
+                                                                                    res_prev->reset();      // 这两个都是布局操场
+                                                                                    auto * gf = model.build_graph(gparams);   // 这个是真正的模型的计算图
+                                                                                    ggml_backend_sched_reserve(sched.get(), gf)  // 这里是真正的给 gf 分配buffer内存
+                                                                                            ggml_gallocr_reserve_n   // 这里使用 galloc 分配内存
+                                                                                                ggml_backend_buft_alloc_buffer  // 这就是后端的分配内存的函数
+                                                                                                            这个函数的作用就是给计算图分配真实的buffer
+                                                                                                            这里传入的图是一个完整的计算图，但是实际上他可能是已经被规划好了，切分成了多块在多个后端上计算
+                                                                                                            这里 是 galloc 来负责分配buffer, 在 scheduler 初始化的时候，我们就初始化好了 galloc
+                                                                                                            galloc 里面有几个数组，记录了每个后端是怎么类型 持有后端指针，buffer指针
+                                                                                                            我们遍历图的每个node的时候，自然会知道他该到那个后端执行
+                                                                                                            这样我们就可以给每个node 和 leaf 的张量的data字段指向真正的buffer中的地址
+                                                                                                            但是在指定之前大段的代码都是在计算每个后端上分配到这里的那块buffer够不够大
+                                                                                                            够大就直接使用，不够大就整块free, 然后重新 alloc
+                                                                                                        
+                                                                                                            大致流程就是： 清空 → 模拟分配 offset → 根据统计的 max_size 真正分配 buffer（或者复用旧 buffer）
+                                                                            pp图构图，内存分配测试就完成了
+                                                                        然后测试为 token generation 阶段准备一个 tg图 测试内存能否分配成功
+                                                                            和上面的一样的过程， 这样也只是测试构图的时候给图分配足够的真实内存，会不会出问题，但没有执行图
+                                                                        TG图测试没问题，就重新再构图成为PP图，当然这次不是为了测试，而是马上就要执行这个pp图了
+                                                                构图 内存 分配测试完成
+
+                                                            13. 计算 buffer 大小并打印信息
+                                                                    遍历所有 backend，打印每个设备计算 buffer 的大小（MiB）
+                                                                    打印 graph 概况
+                                                                    如果 PP 和 TG 的节点数相同，就直接打印；否则打出详细对比
+                                                                    打印切分数，切分数表示调度器为了让 buffer 合适，将计算图拆分成多少段执行
+cpp
+
+                                                           
+                                                            14. 构造完成    至此， llama_context  进入可用状态                                                                                    
                 common_init_from_params的初始化就完成了
     
 
@@ -113,7 +147,7 @@
                     */
 
 
-int main(int argc, char ** argv) {
+int main(int argc, char  argv) {
 
     common_init();   // 通用工具初始化
     llama_backend_init();   // 初始化后端
