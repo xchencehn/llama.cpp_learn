@@ -45,12 +45,22 @@ ggml 中实现并提供了 创建tensor  计算tensor 创建buffer 创建cgraph 
 llama.cpp 中 定义了model能转为cgraph  设计了llama_context运行时  设计了mem管理   设计kv-cache 串起来就可以LLm推理了
 
 但是我们还是有大片的迷雾：
-    1. kv-cache 究竟是怎么运行来加速和节省内存的     我们debug摸进去，然后整体分析代码
-          kv_cache 和 flash_attention 怎么结合的
-          为了实现该kv-cache机制，下一层的mem接口又是怎么设计的
-    2. ggml中的tensor 以及基础算子的计算能否有一个更加清晰透彻的理解
-    3. GGUF 这种文件的设计究竟是怎么实现的，和pth相比有何优势
-    4. 开始研究llama.cpp中主打的量化应该如何实操， 量化的通识，量化在llama.cpp中的实现
+    1. kv-cache 究竟是怎么运行来加速和节省内存的      完成了
+          为了实现该kv-cache机制，下一层的mem接口又是怎么设计的  搞定了
+    2. ggml中的tensor 以及基础算子的计算能否有一个更加清晰透彻的理解   这个解决了
+    3. GGUF 这种文件的设计究竟是怎么实现的，和pth相比有何优势        
+    4. 开始研究llama.cpp中主打的量化应该如何实操， 量化的通识，量化在llama.cpp中的实现    
 
     
+
+============ todo ==================================
+
+// 从磁盘加载模型权重文件，返回 llama_model 对象，这个函数主要解决了 模型的加载流程和权重映射
+static struct llama_model * llama_model_load_from_file_impl(
+        const std::string & path_model,
+        std::vector<std::string> & splits,
+        struct llama_model_params params)  
+
+
+
 

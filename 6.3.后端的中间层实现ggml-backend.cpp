@@ -1,12 +1,14 @@
 
-/*       这个文件 全是函数的实现 使用函数名 来分类
+/*       这个文件 全是 ggml-backend 中各个组件的函数的实现 
            这里的函数 有一些是 在 ggml-backend.h 中定义好的 上层交互接口， 
                     有一些是 在 ggml-backend-impl.h 中定义好的 哪些结构体中的函数指针接口，
                     有一些是为了实现接口又定义的辅助函数
 
 
           这里前面的一些 函数都是 对 设备实例  后端实例 后端缓冲实例 的 set get 类函数
-          后端的 一大段 是对 计算图要如何在 多个GPU 以及 GPU+CPU上计算，做了实现，这部分比较关键
+
+          
+          后端的 一大段 是调度器的实现，这部分比较关键
           
           设计调度器的目的是为了随心所欲的控制ggml能最大化的利用硬件资源来执行计算图：
             1. 计算图只需要定义计算逻辑就可以了，它以张量为节点，算子为边，构成了一个有向无环图，使用 cgraph表示
@@ -17,90 +19,6 @@
                 这样就能实现大量的过程监控和旁路输出操作。
 */
 
-//  这7个 输入的是 后端缓冲区类型
-ggml_backend_buft_name(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的名称
-ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) // 分配后端缓冲区
-ggml_backend_buft_get_alignment(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的对齐要求
-ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的最大大小
-ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) // 获取后端缓冲区类型的分配大小
-ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) // 判断后端缓冲区类型是否为主机缓冲区
-ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的设备
-
-
-//  这16个 输入的是 后端缓冲区实例， 操作缓冲区
-ggml_backend_buffer_init(ggml_backend_buffer_type_t buft, struct ggml_backend_buffer_iface iface, void * context, size_t size) // 初始化后端缓冲区
-ggml_backend_buffer_name(ggml_backend_buffer_t buffer) // 获取后端缓冲区的名称
-ggml_backend_buffer_free(ggml_backend_buffer_t buffer)  // 释放后端缓冲区
-ggml_backend_buffer_get_size(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的大小
-ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的基础指针
-ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) // 初始化后端缓冲区的张量
-ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value)  // 清除后端缓冲区的内容
-ggml_backend_buffer_get_alignment(ggml_backend_buffer_t buffer)   // 获取后端缓冲区的对齐要求
-ggml_backend_buffer_get_max_size(ggml_backend_buffer_t buffer)   // 获取后端缓冲区的最大大小
-ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor)  // 获取后端缓冲区的分配大小
-ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) // 判断后端缓冲区是否为主机缓冲区
-ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage)  // 设置后端缓冲区的使用方式
-ggml_backend_buffer_get_usage(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的使用方式
-ggml_backend_buffer_get_type(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的类型
-ggml_backend_buffer_reset(ggml_backend_buffer_t buffer)   // 重置后端缓冲区
-ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst)   // 复制后端缓冲区的张量
-
-
-// 这里 21 个函数 输入的就是 具体后端的实例， 直接对真实后端操作
-ggml_backend_guid(ggml_backend_t backend)   // 获取后端的唯一标识符
-ggml_backend_name(ggml_backend_t backend)   // 获取后端的名称
-ggml_backend_free(ggml_backend_t backend)   // 释放后端
-ggml_backend_get_default_buffer_type(ggml_backend_t backend)   // 获取后端的默认缓冲区类型
-ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size)   // 分配后端缓冲区
-ggml_backend_get_alignment(ggml_backend_t backend)    // 获取后端的对齐要求
-ggml_backend_get_max_size(ggml_backend_t backend)    // 获取后端的最大大小
-ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size)    // 异步设置后端张量的内容
-ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size)    // 异步获取后端张量的内容
-ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size)    // 设置后端张量的内容
-ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size)    // 获取后端张量的内容
-ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size)    // 异步设置后端张量的内容
-ggml_backend_synchronize(ggml_backend_t backend)    // 同步后端
-ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph)    // 创建后端计算图计划
-ggml_backend_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan)   // 释放后端计算图计划
-ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan)   // 执行后端计算图计划
-ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph)   // 执行后端计算图
-ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph)    // 异步执行后端计算图
-ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op)    // 判断后端是否支持计算图中的操作
-ggml_backend_offload_op(ggml_backend_t backend, const struct ggml_tensor * op)    // 后端是否支持将操作卸载到设备
-ggml_backend_get_device(ggml_backend_t backend)    // 获取后端的设备
-
-// 这两个是 单独对 张量 拷贝用的
-ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst)    // 复制后端张量的内容
-ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, struct ggml_tensor * src, struct ggml_tensor * dst)    // 异步复制后端张量的内容
-
-//  这里就是 对 后端事件 操作的函数，  后端事件 就是 多流同步 和 异步控制的时候使用的
-ggml_backend_event_new(ggml_backend_dev_t device)    // 创建后端事件
-ggml_backend_event_free(ggml_backend_event_t event)    // 释放后端事件
-ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend)  // 记录事件
-ggml_backend_event_synchronize(ggml_backend_event_t event)  // 同步事件
-ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)  // 等待事件
-
-
-// 这14 个 直接对 设备对象 操作
-ggml_backend_dev_name(ggml_backend_dev_t device)  //返回设备名称
-ggml_backend_dev_description(ggml_backend_dev_t device)    //返回设备描述
-ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total)  //返回设备内存信息
-ggml_backend_dev_type(ggml_backend_dev_t device)    //返回设备类型
-ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props)    //返回设备属性
-ggml_backend_dev_backend_reg(ggml_backend_dev_t device)  //返回设备后端注册信息
-ggml_backend_dev_init(ggml_backend_dev_t device, const char * params)  //初始化后端
-ggml_backend_dev_buffer_type(ggml_backend_dev_t device)    //返回设备缓冲区类型
-ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device)    //返回设备主机缓冲区类型
-ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size)  // 从主机指针创建后端缓冲区
-ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op)   // 判断设备是否支持计算图中的操作
-ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft)   // 判断设备是否支持缓冲区类型
-ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op)   // 判断设备是否支持将操作卸载到设备
-
-// 这里是对 后端注册描述符 操作   当时费劲定义那个结构体，就是为了链接这里的函数的
-ggml_backend_reg_name(ggml_backend_reg_t reg)   // 获取后端注册描述符的名称
-ggml_backend_reg_dev_count(ggml_backend_reg_t reg)    // 获取后端注册描述符的设备数量
-ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index)   // 获取后端注册描述符的设备
-ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name)    // 获取后端注册描述符的过程地址
 
 
 /*
@@ -227,9 +145,94 @@ graph_copy_init_tensor(struct ggml_hash_set * hash_set, struct ggml_tensor ** no
 ggml_backend_graph_copy(ggml_backend_t backend, struct ggml_cgraph * graph) //复制后端计算图
 ggml_backend_graph_copy_free(struct ggml_backend_graph_copy copy) // 释放复制的后端计算图所占用的资源
 ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t backend2, struct ggml_cgraph * graph, 
-    ggml_backend_eval_callback callback, void * user_data, struct ggml_tensor * test_node) // 比较两个后端在给定计算图上的执行结果
+ggml_backend_eval_callback callback, void * user_data, struct ggml_tensor * test_node) // 比较两个后端在给定计算图上的执行结果
 
 
+
+//  这7个 输入的是 后端缓冲区类型
+ggml_backend_buft_name(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的名称
+ggml_backend_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) // 分配后端缓冲区
+ggml_backend_buft_get_alignment(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的对齐要求
+ggml_backend_buft_get_max_size(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的最大大小
+ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) // 获取后端缓冲区类型的分配大小
+ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) // 判断后端缓冲区类型是否为主机缓冲区
+ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft) // 获取后端缓冲区类型的设备
+
+
+//  这16个 输入的是 后端缓冲区实例， 操作缓冲区
+ggml_backend_buffer_init(ggml_backend_buffer_type_t buft, struct ggml_backend_buffer_iface iface, void * context, size_t size) // 初始化后端缓冲区
+ggml_backend_buffer_name(ggml_backend_buffer_t buffer) // 获取后端缓冲区的名称
+ggml_backend_buffer_free(ggml_backend_buffer_t buffer)  // 释放后端缓冲区
+ggml_backend_buffer_get_size(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的大小
+ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的基础指针
+ggml_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) // 初始化后端缓冲区的张量
+ggml_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value)  // 清除后端缓冲区的内容
+ggml_backend_buffer_get_alignment(ggml_backend_buffer_t buffer)   // 获取后端缓冲区的对齐要求
+ggml_backend_buffer_get_max_size(ggml_backend_buffer_t buffer)   // 获取后端缓冲区的最大大小
+ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor)  // 获取后端缓冲区的分配大小
+ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) // 判断后端缓冲区是否为主机缓冲区
+ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage)  // 设置后端缓冲区的使用方式
+ggml_backend_buffer_get_usage(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的使用方式
+ggml_backend_buffer_get_type(ggml_backend_buffer_t buffer)  // 获取后端缓冲区的类型
+ggml_backend_buffer_reset(ggml_backend_buffer_t buffer)   // 重置后端缓冲区
+ggml_backend_buffer_copy_tensor(const struct ggml_tensor * src, struct ggml_tensor * dst)   // 复制后端缓冲区的张量
+
+
+// 这里 21 个函数 输入的就是 具体后端的实例， 直接对真实后端操作
+ggml_backend_guid(ggml_backend_t backend)   // 获取后端的唯一标识符
+ggml_backend_name(ggml_backend_t backend)   // 获取后端的名称
+ggml_backend_free(ggml_backend_t backend)   // 释放后端
+ggml_backend_get_default_buffer_type(ggml_backend_t backend)   // 获取后端的默认缓冲区类型
+ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size)   // 分配后端缓冲区
+ggml_backend_get_alignment(ggml_backend_t backend)    // 获取后端的对齐要求
+ggml_backend_get_max_size(ggml_backend_t backend)    // 获取后端的最大大小
+ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size)    // 异步设置后端张量的内容
+ggml_backend_tensor_get_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size)    // 异步获取后端张量的内容
+ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size)    // 设置后端张量的内容
+ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size)    // 获取后端张量的内容
+ggml_backend_tensor_memset(struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size)    // 异步设置后端张量的内容
+ggml_backend_synchronize(ggml_backend_t backend)    // 同步后端
+ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph)    // 创建后端计算图计划
+ggml_backend_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan)   // 释放后端计算图计划
+ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan)   // 执行后端计算图计划
+ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph)   // 执行后端计算图
+ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph)    // 异步执行后端计算图
+ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op)    // 判断后端是否支持计算图中的操作
+ggml_backend_offload_op(ggml_backend_t backend, const struct ggml_tensor * op)    // 后端是否支持将操作卸载到设备
+ggml_backend_get_device(ggml_backend_t backend)    // 获取后端的设备
+
+// 这两个是 单独对 张量 拷贝用的
+ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst)    // 复制后端张量的内容
+ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, struct ggml_tensor * src, struct ggml_tensor * dst)    // 异步复制后端张量的内容
+
+//  这里就是 对 后端事件 操作的函数，  后端事件 就是 多流同步 和 异步控制的时候使用的
+ggml_backend_event_new(ggml_backend_dev_t device)    // 创建后端事件
+ggml_backend_event_free(ggml_backend_event_t event)    // 释放后端事件
+ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend)  // 记录事件
+ggml_backend_event_synchronize(ggml_backend_event_t event)  // 同步事件
+ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)  // 等待事件
+
+
+// 这14 个 直接对 设备对象 操作
+ggml_backend_dev_name(ggml_backend_dev_t device)  //返回设备名称
+ggml_backend_dev_description(ggml_backend_dev_t device)    //返回设备描述
+ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total)  //返回设备内存信息
+ggml_backend_dev_type(ggml_backend_dev_t device)    //返回设备类型
+ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props)    //返回设备属性
+ggml_backend_dev_backend_reg(ggml_backend_dev_t device)  //返回设备后端注册信息
+ggml_backend_dev_init(ggml_backend_dev_t device, const char * params)  //初始化后端
+ggml_backend_dev_buffer_type(ggml_backend_dev_t device)    //返回设备缓冲区类型
+ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device)    //返回设备主机缓冲区类型
+ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size)  // 从主机指针创建后端缓冲区
+ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op)   // 判断设备是否支持计算图中的操作
+ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft)   // 判断设备是否支持缓冲区类型
+ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op)   // 判断设备是否支持将操作卸载到设备
+
+// 这里是对 后端注册描述符 操作   当时费劲定义那个结构体，就是为了链接这里的函数的
+ggml_backend_reg_name(ggml_backend_reg_t reg)   // 获取后端注册描述符的名称
+ggml_backend_reg_dev_count(ggml_backend_reg_t reg)    // 获取后端注册描述符的设备数量
+ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index)   // 获取后端注册描述符的设备
+ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name)    // 获取后端注册描述符的过程地址
 
 
 //  下面就是 和 设备后端buffer一样的 东西 在cpu侧又实现了一遍， cpu后端是必须的，某个算子设备后端不支持了，就会下发到cpu后端上执行

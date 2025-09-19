@@ -36,7 +36,7 @@
                                                                         获取K和V的嵌入维度
                                                                         选择缓冲区类型 buft 和设备dev_name
                                                                         在每层执行到这里的时候都使用 ggml_init(params) 初始化了一个ggml_context * ctx, 这里分配了一块 当前程序的堆内存，用于管理张量元数据
-                                                                        使用ctx 创建出了 k 和 v 需要的张量， 每个 都是一个3D张量， 从内到外依次是 embeding维度，token的数量，序列的数量
+                                                                        使用ctx 创建出了 k 和 v 需要的张量， 每个 都是一个3D张量， 从内到外依次是 embeding维度，上下文窗口长度，序列的数量 不会扩容
                                                                         需要注意的是，这里只是创建了张量的元数据，并不会立即发生内存分配 ，这是因为 ctx 中的参数 .no_alloc = true
                                                                         所以在下面还有 一段代码 ggml_backend_alloc_ctx_tensors_from_buft 专门分配内存
                                                                         而且每个张量都是有名字字段的，这里给命名为 cache_k_l0  cache_k_l1 等
@@ -59,26 +59,42 @@
 */
 
 
-/*  滑动窗口
-滑动窗口注意力是一种优化Transformer模型注意力计算的技术，其核心思想是限制每个token只能关注固定窗口内的其他token，而不是全局所有token。
+/*
+    kv-cache 中的数据是怎么存储，怎么访问的呢？
 
-那这里new出来的 是一个 llama_kv_cache_iswa 是个什么机制呢？
-    这个指的是 在 gemma3 模型的内部， 有的layer使用的是线性注意力机制，但有的layer使用是全序列的layer的注意力机制。
+kv-cache通过 llama_memory_i 指针 可以操作 kv-cache 对象
+
+    kv-cache 中的数据 首先是按层划分的 kv-cache 中有一个 成员 layers  可以取到每层的 layer
+        每层都可能被分配到不同的后端，而且计算attentino 也是每层算一次
+        这一层中，会一次性从后端 分配下来两个大的 buffer 块，当然这里是用 张量的形式，直接创建两个大的张量就可以了
+        这个 k 张量中就存 所有序列的所有token在这层的 k 缓存， v张量 就存 v 缓存 形状都是 [ embeding维度，上下文窗口长度，序列的数量 ]
+        这个时候存的地方有了
+    但是有新的问题需要考虑，如果是多序列，长上下文的情况，序列的数量 超过了 k v 张量的序列的数量维度， 上下文的长度也超过了上下文窗口长度 的长度
+    此外还有 一个序列多采样的 需求，这个时候必然要 在序列分裂的时候，两个序列共享前面的token 的kv缓存
+    这个时候就需要在 将 layer 层中的 kv 张量 中的每个 token 位置 看做一个 槽位， 使用 vcell 来对应，以后读写数据都通过cell来读写
+    刚开始的时候，每个 槽位 和 每个cell 一一对应，一共 上下文窗口长度 x 序列的数量 个，一行就是一个序列，一列就该位置的所有 token
+    
+    开始，对应数量的序列进来推理， 一轮 prefill 阶段后， 然后 几个 decode 计算后就已经满了，
+    下一次推理开始前就要 处理 kv缓存了， 由于我们采用的是 窗口上下文机制， 满了之后只需要丢弃最早的就行
+    那么我们可以 让第一列 cell 拼接到行尾，然后告诉调度器可以继续往最后一列 cell 写数据， 这样就解决了 数据搬移的问题
+                // 注： 实际上是 收尾相连成环形列表，一个head指针一直next 就可以了
+
+    然后过了一会 我们有一个序列需要分裂了，这样新序列产生的token 所有行都满了，没行放了，就会报错
+    再一次，我们为了分裂 留了一行 位置出来
+        分裂时，会把要分裂的那一行的cell 中有个描述当前cell属于哪个序列的字段中，也加上新分类出来的序列号，这意味着这些cell同时属于连个序列 这样就相当于两个序列复用了前面的数据了，
+        然后让最后一行 绑定新的序列
+        然后再执行一次 让第一列 cell 拼接到行尾，然后告诉调度器可以继续往最后一列 cell 写数据了
+    这样就完成分裂了
+
+    为了更好的控制分裂，我们把 cell 的一行再次封装为一个 stream ， 然后 每个 seq 进来使用 kv-cache 就和某个 stream 绑定
+    如果stream 资源消耗完了，就会报错
+
+    这样我们使用 每层分开，每层两 kv 大张量作为物理buffer, 上层逻辑划分为 vcell 和 sream 的方式，就把kv-cache管理起来了
+    实现了 滑动窗口 和 分裂token复用 的能力
+
 */
 
-/*   智能指针
 
-将这个实例包装在一个 std::unique_ptr 智能指针中
-        kv_base = std::make_unique<llama_kv_cache>    //使用正常的非滑动窗口的全序列注意力机制
-        kv_swa = std::make_unique<llama_kv_cache>     // 使用滑动窗口的注意力机制
-
-使用 std::make_unique 而不是直接使用 new 有几个优势：
-1. 异常安全 ：如果构造函数抛出异常，不会发生内存泄漏
-2. 资源管理 ：智能指针会自动在适当的时候释放内存，防止内存泄漏
-这种写法是现代C++中推荐的资源管理方式，特别是在处理需要动态分配的对象时。
-
-
-*/
 
 
 
@@ -160,7 +176,7 @@ llama_kv_cache::llama_kv_cache(
 
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
-        LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
+        LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled padding V cache to %d\n",
                 __func__, hparams.n_embd_v_gqa_max());
     }
 
@@ -226,12 +242,12 @@ llama_kv_cache::llama_kv_cache(
             const int32_t il_reuse = reuse(il);
 
             if (il_reuse < 0) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: no reuse\n", __func__, il);
+                LLAMA_LOG_DEBUG("%s: layer %3d: no reuse\n", __func__, il);
                 continue;
             }
 
             if (filter && !filter(il)) {
-                LLAMA_LOG_DEBUG("%s: - layer %3d: filtered\n", __func__, il);
+                LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
                 continue;
             }
 
@@ -239,7 +255,7 @@ llama_kv_cache::llama_kv_cache(
 
             map_layer_ids[il] = map_layer_ids[il_reuse];
 
-            LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
+            LLAMA_LOG_DEBUG("%s: layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
     }
 
@@ -401,7 +417,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
 
-    // enqueue the copy operation - the buffer copy will be performed during the next update
+    // enqueue the copy operation the buffer copy will be performed during the next update
     sc_info.ssrc.push_back(s0);
     sc_info.sdst.push_back(s1);
 
@@ -779,7 +795,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                         cur = std::to_string(cells.pos_get(i));
                     }
                     const int n = cur.size();
-                    for (int j = 0; j < 5 - n; ++j) {
+                    for (int j = 0; j < 5 n; ++j) {
                         cur += ' ';
                     }
                     ss += cur;
@@ -859,7 +875,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
         while (true) {
             if (head_cur + n_test > cells.size()) {
-                n_tested += cells.size() - head_cur;
+                n_tested += cells.size() head_cur;
                 head_cur = 0;
                 continue;
             }
@@ -874,10 +890,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 //const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
                 // can we use this cell? either:
-                //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
+                //  the cell is empty
+                //  the cell is occupied only by one sequence:
+                //    (disabled) mask causally, if the sequence is the same as the one we are inserting
+                //    mask SWA, using current max pos for that sequence in the cache
                 //                always insert in the cell with minimum pos
                 bool can_use = cells.is_empty(idx);
 
@@ -923,7 +939,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
         }
 
-        // we didn't find a suitable slot - return empty result
+        // we didn't find a suitable slot return empty result
         if (res.idxs[s].size() < n_tokens) {
             return { };
         }
@@ -1045,7 +1061,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.s1 sinfo.s0 + 1;
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k, hparams.n_head_kv(il), n_kv, ns,
@@ -1066,7 +1082,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     // [TAG_V_CACHE_VARIABLE]
     assert(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t ns = sinfo.s1 sinfo.s0 + 1;
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
@@ -1167,7 +1183,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
 
     // [TAG_V_CACHE_VARIABLE]
     if (n_embd_gqa < v->ne[0]) {
-        v_cur = ggml_pad(ctx, v_cur, v->ne[0] - n_embd_gqa, 0, 0, 0);
+        v_cur = ggml_pad(ctx, v_cur, v->ne[0] n_embd_gqa, 0, 0, 0);
     }
 
     // in this branch the v_idxs are constructed in such a way that each row is a single head element
@@ -1288,13 +1304,13 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     // It's assumed that if a token in the batch has multiple sequences, they are equivalent.
     // Example with a cache of 10 tokens, 2 tokens populated in cache and 3 tokens in batch:
     //   Causal mask:
-    //      xxx-------
-    //      xxxx------
-    //      xxxxx-----
+    //      xxx-
+    //      xxxx
+    //      xxxxx--
     //   Non-causal mask:
-    //      xxxxx-----
-    //      xxxxx-----
-    //      xxxxx-----
+    //      xxxxx--
+    //      xxxxx--
+    //      xxxxx--
     // To visualize the mask, see https://github.com/ggml-org/llama.cpp/pull/12615
     // TODO: optimize this section
     for (uint32_t h = 0; h < 1; ++h) {
@@ -1332,7 +1348,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                         continue;
                     }
 
-                    data[idst + j] = hparams.use_alibi ? -std::abs(p0 - p1) : 0.0f;
+                    data[idst + j] = hparams.use_alibi ? -std::abs(p0 p1) : 0.0f;
                 }
             }
         }
@@ -1355,7 +1371,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     for (int h = 0; h < 1; ++h) {
         for (int i = 0; i < n_tokens; ++i) {
             for (int j = 0; j < n_kv; ++j) {
-                // the position when the cells is empty is irrelevant - it will be masked out later in the attention
+                // the position when the cells is empty is irrelevant it will be masked out later in the attention
                 const llama_pos p0 = cells.is_empty(j) ? -1 : cells.pos_get(j);
 
                 data[h*(n_kv*n_tokens) + i*n_kv + j] = llama_relative_position_bucket(p0, ubatch->pos[i], hparams.n_rel_attn_bkts, false);
@@ -1547,7 +1563,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
         uint32_t cell_count_check = 0;
         for (const auto & range : cr.data) {
-            cell_count_check += range.second - range.first;
+            cell_count_check += range.second range.first;
         }
         GGML_ASSERT(cell_count == cell_count_check);
 
@@ -1657,7 +1673,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         // Read each range of cells of k_size length each into tmp_buf and write out
         for (const auto & range : cr.data) {
-            const size_t range_size = range.second - range.first;
+            const size_t range_size = range.second range.first;
             const size_t buf_size = range_size * k_size_row;
             io.write_tensor(k, range.first * k_size_row, buf_size);
         }
@@ -1681,7 +1697,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
             // Read each range of cells of v_size length each into tmp_buf and write out
             for (const auto & range : cr.data) {
-                const size_t range_size = range.second - range.first;
+                const size_t range_size = range.second range.first;
                 const size_t buf_size = range_size * v_size_row;
                 io.write_tensor(v, range.first * v_size_row, buf_size);
             }
@@ -1712,7 +1728,7 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
             for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                 // Read each range of cells of v_size_el length each into tmp_buf and write out
                 for (const auto & range : cr.data) {
-                    const size_t range_size = range.second - range.first;
+                    const size_t range_size = range.second range.first;
                     const size_t src_offset = (range.first + j * kv_size) * v_size_el;
                     const size_t buf_size = range_size * v_size_el;
                     io.write_tensor(v, src_offset, buf_size);
@@ -1748,7 +1764,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            // read the sequence id, but directly discard it - we will use dest_seq_id instead
+            // read the sequence id, but directly discard it we will use dest_seq_id instead
             {
                 llama_seq_id seq_id;
                 io.read_to(&seq_id, sizeof(seq_id));
@@ -1774,13 +1790,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         LLAMA_LOG_DEBUG("%s: head_cur = %d, head = %d, cell_count = %d, dest_seq_id = %d\n", __func__, head_cur, head, cell_count, dest_seq_id);
 
-        // DEBUG CHECK: head_cur should be our first cell, head_cur + cell_count - 1 should be our last cell (verify seq_id and pos values)
+        // DEBUG CHECK: head_cur should be our first cell, head_cur + cell_count 1 should be our last cell (verify seq_id and pos values)
         // Assume that this is one contiguous block of cells
         GGML_ASSERT(head_cur + cell_count <= cells.size());
         GGML_ASSERT(cells.pos_get(head_cur)                  == ubatch.pos[0]);
-        GGML_ASSERT(cells.pos_get(head_cur + cell_count - 1) == ubatch.pos[cell_count - 1]);
+        GGML_ASSERT(cells.pos_get(head_cur + cell_count 1) == ubatch.pos[cell_count 1]);
         GGML_ASSERT(cells.seq_has(head_cur,                  dest_seq_id));
-        GGML_ASSERT(cells.seq_has(head_cur + cell_count - 1, dest_seq_id));
+        GGML_ASSERT(cells.seq_has(head_cur + cell_count 1, dest_seq_id));
     } else {
         // whole KV cache restore
 
@@ -1967,10 +1983,10 @@ llama_kv_cache_context::llama_kv_cache_context(
 
     const uint32_t n_stream = kv->get_n_stream();
 
-    // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
+    // create a dummy slot info the actual data is irrelevant. we just need to build the graph
     sinfos.resize(1);
     sinfos[0].s0 = 0;
-    sinfos[0].s1 = n_stream - 1;
+    sinfos[0].s1 = n_stream 1;
     sinfos[0].idxs.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         sinfos[0].strm.push_back(s);
